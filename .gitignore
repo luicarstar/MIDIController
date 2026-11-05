@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# PyInstaller (build artifacts — 200MB+, never commit)
+build/
+dist/
+*.manifest
+build-last.log
+
+# Qt / IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.swp
+.DS_Store
