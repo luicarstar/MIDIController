@@ -5,3 +5,4 @@ pycaw==20260927
 comtypes==1.4.17
 psutil==7.2.2
 qtawesome==1.4.2
+-r requirements-ble.txt

@@ -3,7 +3,10 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['mido.backends.rtmidi', 'rtmidi']
+hiddenimports = ['mido.backends.rtmidi', 'rtmidi', 'winrt.runtime',
+                 'winrt.windows.devices.midi', 'winrt.windows.devices.enumeration',
+                 'winrt.windows.storage.streams', 'winrt.windows.foundation',
+                 'winrt.windows.foundation.collections']
 tmp_ret = collect_all('qtawesome')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

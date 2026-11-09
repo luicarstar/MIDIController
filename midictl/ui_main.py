@@ -2,22 +2,25 @@
 from __future__ import annotations
 
 import time
+import threading
+from collections import deque
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import QObject, Qt, Signal, QTimer, QUrl
+from PySide6.QtGui import QAction, QIcon, QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView,
-                               QInputDialog, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox,
+                               QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QSplitter, QStyle, QSystemTrayIcon,
                                QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
 from . import midi_io, win_input
 from .style import icon
 from .actions import describe_actions
-from .config import GLOBAL_PROFILE, default_mapping, new_id, save_config, clone
+from .config import GLOBAL_PROFILE, default_mapping, new_id, save_config, clone, add_keyboard, input_ports
 from .engine import Engine
 from .foreground import foreground_exe
 from .hud import Hud
 from .ui_mapping import MappingDialog
+from .ui_feedback import FeedbackDialog
 
 
 class Bridge(QObject):
@@ -27,6 +30,8 @@ class Bridge(QObject):
     profile = Signal(str, str)
     variables = Signal(dict)
     hud = Signal(str)
+    connection = Signal(str)
+    ports = Signal(object, object)
 
 
 def icon_btn(widget, name, tip, slot, color="#5b6e70") -> QToolButton:
@@ -58,18 +63,24 @@ class MainWindow(QMainWindow):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
+        self._monitor_pending = deque(maxlen=128)
+        self._monitor_lock = threading.Lock()
         self.bridge = Bridge()
         self.engine = Engine(cfg, log=self.bridge.log.emit)
-        self.engine.on_midi = self.bridge.midi.emit
+        self.engine.on_midi = self._buffer_midi
         self.engine.on_profile_changed = self.bridge.profile.emit
         self.engine.on_variables = self.bridge.variables.emit
         self.engine.on_hud = self.bridge.hud.emit
+        self.engine.on_connection_changed = self.bridge.connection.emit
+        self.engine.on_ports_changed = self.bridge.ports.emit
         self.hud = Hud()
         self.bridge.hud.connect(self.hud.show_text)
         self.bridge.midi.connect(self._on_midi)
         self.bridge.log.connect(self._log)
         self.bridge.profile.connect(self._on_profile_changed)
         self.bridge.variables.connect(self._on_variables)
+        self.bridge.ports.connect(self._populate_ports)
+        self.bridge.connection.connect(lambda text: self.connection_label.setText(text))
         self._quitting = False
         self._last_midi_key = None
 
@@ -78,8 +89,13 @@ class MainWindow(QMainWindow):
         self.resize(1000, 680)
         self._build_ui()
         self._build_tray()
+        self._refresh_keyboards()
         self._refresh_ports()
         self._refresh_profiles()
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.setInterval(50)
+        self.monitor_timer.timeout.connect(self._flush_monitor)
+        self.monitor_timer.start()
         self.engine.start()
 
     # ---------- layout ----------
@@ -89,24 +105,56 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(12, 12, 12, 8)
         v.setSpacing(10)
 
+        keyboard_bar = QHBoxLayout()
+        keyboard_bar.addWidget(QLabel("键盘配置"))
+        self.keyboard_combo = QComboBox()
+        self.keyboard_combo.setMinimumWidth(220)
+        self.keyboard_combo.setToolTip("每份键盘配置可同时勾选多个输入，保存独立的应用映射；一次启用一份配置")
+        self.keyboard_combo.activated.connect(self._keyboard_changed)
+        keyboard_bar.addWidget(self.keyboard_combo)
+        new_keyboard = QPushButton("新建键盘")
+        new_keyboard.clicked.connect(lambda: self._add_keyboard(copy_current=False))
+        keyboard_bar.addWidget(new_keyboard)
+        copy_keyboard = QPushButton("复制键盘")
+        copy_keyboard.clicked.connect(lambda: self._add_keyboard(copy_current=True))
+        keyboard_bar.addWidget(copy_keyboard)
+        feedback = QPushButton("反馈绑定")
+        feedback.setToolTip("将本软件启用、键盘、应用Profile或变量状态发到当前MIDI输出端口")
+        feedback.clicked.connect(self._edit_feedback)
+        keyboard_bar.addWidget(feedback)
+        bluetooth = QPushButton("系统蓝牙设置")
+        bluetooth.setToolTip("请先在Windows设置完成配对；本程序不自动配对。WinRT列表也可能包含USB设备。")
+        bluetooth.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("ms-settings:bluetooth")))
+        keyboard_bar.addWidget(bluetooth)
+        keyboard_bar.addStretch(1)
+        v.addLayout(keyboard_bar)
+        self.connection_label = QLabel("等待连接")
+        self.connection_label.setObjectName("hint")
+        self.connection_label.setWordWrap(True)
+        v.addWidget(self.connection_label)
+
         topbar = QWidget()
         topbar.setObjectName("topbar")
         topbar.setAttribute(Qt.WA_StyledBackground, True)
         bar = QHBoxLayout(topbar)
         bar.setContentsMargins(12, 8, 12, 8)
         bar.setSpacing(8)
-        self.in_combo = QComboBox()
+        self.in_list = QListWidget()
         self.out_combo = QComboBox()
-        self.in_combo.setMinimumWidth(200)
+        self.in_list.setMinimumWidth(250)
+        self.in_list.setMaximumHeight(84)
+        self.in_list.setToolTip("先在系统设置配对蓝牙设备，再刷新并选择WinRT端点。\n"
+                               "同设备若同时出现WinMM/WinRT，只选一种；程序不会自动双开。\n"
+                               "WinRT按稳定ID保存，取消勾选停止重连；鼠标悬停查看来源ID。")
         self.out_combo.setMinimumWidth(200)
-        self.in_combo.activated.connect(self._ports_changed)
+        self.in_list.itemChanged.connect(self._ports_changed)
         self.out_combo.activated.connect(self._ports_changed)
         dev = QLabel()
         dev.setPixmap(icon("plugs-connected", "#3a9e8f").pixmap(18, 18))
         bar.addWidget(dev)
-        bar.addWidget(QLabel("输入"))
-        bar.addWidget(self.in_combo)
-        bar.addWidget(QLabel("输出"))
+        bar.addWidget(QLabel("输入\n可多选"))
+        bar.addWidget(self.in_list)
+        bar.addWidget(QLabel("输出\nWinMM"))
         bar.addWidget(self.out_combo)
         bar.addWidget(icon_btn(self, "arrows-clockwise", "刷新设备", self._refresh_ports))
         bar.addStretch(1)
@@ -186,6 +234,11 @@ class MainWindow(QMainWindow):
         bottom, bv = panel()
         bh = QHBoxLayout()
         bh.addWidget(title("MIDI 监视"))
+        self.diagnostics_cb = QCheckBox("原始诊断")
+        self.diagnostics_cb.setChecked(self.cfg["settings"].get("diagnostics", False))
+        self.diagnostics_cb.setToolTip("限速显示后端原始消息；不支持类型仅诊断，不执行或学习。最多500行。")
+        self.diagnostics_cb.toggled.connect(lambda on: self._set_setting("diagnostics", on))
+        bh.addWidget(self.diagnostics_cb)
         bh.addStretch(1)
         bh.addWidget(icon_btn(self, "eraser", "清空", lambda: self.monitor.clear()))
         bv.addLayout(bh)
@@ -226,11 +279,23 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     # ---------- helpers ----------
-    def save(self):
+    def save(self, mappings_changed=False):
+        if mappings_changed:
+            self.engine.mappings_changed()
         save_config(self.cfg)
+        self.engine.request_feedback()
+
+    def _edit_feedback(self):
+        dialog = FeedbackDialog(self.cfg, self)
+        if dialog.exec():
+            self.engine.set_feedback_bindings(dialog.bindings)
+            self.save()
 
     def _set_setting(self, key, val):
-        self.cfg["settings"][key] = val
+        if key == "enabled":
+            self.engine.set_enabled(val)
+        else:
+            self.cfg["settings"][key] = val
         self.save()
         if key == "app_switching":
             self.engine._q.put("fg")
@@ -241,8 +306,9 @@ class MainWindow(QMainWindow):
 
     def _on_midi(self, ev):
         # Continuous controls (CC / pitch bend) update the last line instead of flooding
-        key = ev.key if ev.kind in ("cc", "pitchwheel") else None
-        line = f"{time.strftime('%H:%M:%S')}  {ev.describe()}"
+        key = ev.key if ev.kind in ("cc", "cc14", "rpn", "nrpn", "pitchwheel", "aftertouch", "polytouch") else None
+        raw = f" raw={ev.raw_value}" if ev.kind == "pitchwheel" else ""
+        line = f"{time.strftime('%H:%M:%S')}  {self.engine.source_label(ev.source)} {ev.describe()}{raw}"
         if key is not None and key == self._last_midi_key:
             block = self.monitor.document().lastBlock()
             cur = self.monitor.textCursor()
@@ -252,6 +318,19 @@ class MainWindow(QMainWindow):
         else:
             self.monitor.appendPlainText(line)
         self._last_midi_key = key
+
+    def _buffer_midi(self, ev):
+        with self._monitor_lock:
+            self._monitor_pending.append(ev)
+
+    def _flush_monitor(self):
+        with self._monitor_lock:
+            events = list(self._monitor_pending)
+            self._monitor_pending.clear()
+        for ev in events:
+            self._on_midi(ev)
+        for line in self.engine.drain_diagnostics():
+            self._log(line)
 
     def _on_variables(self, v: dict):
         self.status_vars.setText("  变量: " + ", ".join(f"{k}={val}" for k, val in sorted(v.items())))
@@ -271,10 +350,58 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     # ---------- ports ----------
+    def _refresh_keyboards(self):
+        self.keyboard_combo.blockSignals(True)
+        self.keyboard_combo.clear()
+        for keyboard in self.cfg["keyboards"]:
+            self.keyboard_combo.addItem(keyboard["name"], keyboard["id"])
+        self.keyboard_combo.setCurrentIndex(self.keyboard_combo.findData(self.cfg["active_keyboard"]))
+        self.keyboard_combo.blockSignals(False)
+
+    def _keyboard_changed(self, *_):
+        keyboard_id = self.keyboard_combo.currentData()
+        if not keyboard_id or keyboard_id == self.cfg["active_keyboard"]:
+            return
+        self.engine.select_keyboard(keyboard_id)
+        self.save()
+        self._last_midi_key = None
+        self._refresh_ports()
+        self._refresh_profiles()
+
+    def _add_keyboard(self, copy_current=False):
+        name, ok = QInputDialog.getText(self, "复制键盘" if copy_current else "新建键盘", "键盘配置名称")
+        if not ok:
+            return
+        try:
+            keyboard = add_keyboard(self.cfg, name, copy_current=copy_current)
+        except ValueError as e:
+            QMessageBox.warning(self, "键盘配置", str(e))
+            return
+        self.engine.select_keyboard(keyboard["id"])
+        self.save()
+        self._refresh_keyboards()
+        self._last_midi_key = None
+        self._refresh_ports()
+        self._refresh_profiles()
+
     def _refresh_ports(self):
+        self.engine.refresh_ports()
+
+    def _populate_ports(self, inputs, outputs):
         s = self.cfg["settings"]
-        for combo, names, cur in ((self.in_combo, midi_io.list_inputs(), s.get("input_port")),
-                                  (self.out_combo, midi_io.list_outputs(), s.get("output_port"))):
+        selected = input_ports(s)
+        self.in_list.blockSignals(True)
+        self.in_list.clear()
+        for name in dict.fromkeys(selected + list(inputs)):
+            label = self.engine.source_label(name)
+            item = QListWidgetItem(label if name in inputs else f"{label} (未连接)")
+            item.setData(Qt.UserRole, name)
+            item.setToolTip(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in selected else Qt.Unchecked)
+            self.in_list.addItem(item)
+        self.in_list.blockSignals(False)
+        for combo, names, cur in ((self.out_combo, outputs, s.get("output_port")),):
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("(无)", "")
@@ -284,13 +411,12 @@ class MainWindow(QMainWindow):
                 combo.addItem(f"{cur} (未连接)", cur)
             combo.setCurrentIndex(max(0, combo.findData(cur or "")))
             combo.blockSignals(False)
-        self.engine.open_ports()
 
-    def _ports_changed(self):
-        self.cfg["settings"]["input_port"] = self.in_combo.currentData() or ""
-        self.cfg["settings"]["output_port"] = self.out_combo.currentData() or ""
+    def _ports_changed(self, *_):
+        selected = [self.in_list.item(i).data(Qt.UserRole) for i in range(self.in_list.count())
+                    if self.in_list.item(i).checkState() == Qt.Checked]
+        self.engine.bind_ports(selected, self.out_combo.currentData() or "")
         self.save()
-        self.engine.open_ports()
 
     # ---------- profiles ----------
     def _refresh_profiles(self, select: int = 0):
@@ -359,7 +485,12 @@ class MainWindow(QMainWindow):
             chk.setCheckState(Qt.Checked if m.get("enabled", True) else Qt.Unchecked)
             self.table.setItem(r, 0, chk)
             self.table.setItem(r, 1, QTableWidgetItem(m.get("name", "")))
-            self.table.setItem(r, 2, QTableWidgetItem(midi_io.describe_trigger(m["trigger"])))
+            trigger = m["trigger"]
+            source = trigger.get("source") or "任意来源"
+            precision = " | 完整精度" if trigger.get("kind") == "pitchwheel" and trigger.get("value_mode") == "full" else ""
+            label = "任意来源" if not trigger.get("source") else self.engine.source_label(source)
+            self.table.setItem(r, 2, QTableWidgetItem(
+                f"{label} | {midi_io.describe_trigger(trigger)}{precision}"))
             cond = m.get("conditions", "") + (" [停止后续]" if m.get("stop") else "")
             self.table.setItem(r, 3, QTableWidgetItem(cond))
             self.table.setItem(r, 4, QTableWidgetItem(describe_actions(m.get("actions", []))))
@@ -368,7 +499,7 @@ class MainWindow(QMainWindow):
     def _item_changed(self, item):
         if item.column() == 0:
             self._profile()["mappings"][item.row()]["enabled"] = item.checkState() == Qt.Checked
-            self.save()
+            self.save(mappings_changed=True)
 
     def _row(self) -> int:
         rows = self.table.selectionModel().selectedRows()
@@ -383,7 +514,7 @@ class MainWindow(QMainWindow):
         m = self._open_dialog(default_mapping())
         if m:
             self._profile()["mappings"].append(m)
-            self.save()
+            self.save(mappings_changed=True)
             self._refresh_table()
             self.table.selectRow(self.table.rowCount() - 1)
 
@@ -395,7 +526,7 @@ class MainWindow(QMainWindow):
         m = self._open_dialog(maps[r])
         if m:
             maps[r] = m
-            self.save()
+            self.save(mappings_changed=True)
             self._refresh_table()
             self.table.selectRow(r)
 
@@ -426,7 +557,7 @@ class MainWindow(QMainWindow):
         r = self._row()
         if r >= 0:
             del self._profile()["mappings"][r]
-            self.save()
+            self.save(mappings_changed=True)
             self._refresh_table()
 
     # ---------- lifecycle ----------

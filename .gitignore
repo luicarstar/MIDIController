@@ -21,3 +21,11 @@ Thumbs.db
 Desktop.ini
 *.swp
 .DS_Store
+
+# Local user configuration and task artifacts
+config.json
+*.bak
+*.log
+work/
+outputs/
+docs/superpowers/

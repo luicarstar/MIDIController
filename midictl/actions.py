@@ -10,7 +10,8 @@ import webbrowser
 import mido
 
 from . import rules, win_input
-from .midi_io import MidiEvent, direction
+from .midi_io import (MidiEvent, direction, relative_delta, value_bounds,
+                      event_for_trigger, button_state, trigger_matches)
 
 ACTION_TYPES = {
     "key": "键盘按键/组合键",
@@ -32,6 +33,23 @@ ACTION_TYPES = {
 }
 MEDIA_KEYS = {"playpause": "播放/暂停", "nexttrack": "下一曲", "prevtrack": "上一曲",
               "stop": "停止", "volumeup": "音量+", "volumedown": "音量-", "volumemute": "静音"}
+
+
+def make_midi_message(action: dict, value: int | None = None) -> mido.Message:
+    """Shared encoding for action output and application-state feedback."""
+    channel = max(1, min(16, int(action.get("channel", 1)))) - 1
+    number = max(0, min(127, int(action.get("number", 0))))
+    value = max(0, min(127, int(action.get("value", 127) if value is None else value)))
+    kind = action.get("message", "note_on")
+    if kind == "note_on":
+        return mido.Message(kind, channel=channel, note=number, velocity=value)
+    if kind == "note_off":
+        return mido.Message(kind, channel=channel, note=number, velocity=0)
+    if kind == "control_change":
+        return mido.Message(kind, channel=channel, control=number, value=value)
+    if kind == "program_change":
+        return mido.Message(kind, channel=channel, program=number)
+    raise ValueError("不支持的 MIDI 输出类型")
 
 
 def default_action(t: str) -> dict:
@@ -139,16 +157,26 @@ class Volume:
 
 
 def _norm_value(ev: MidiEvent) -> float:
-    if ev.kind == "pitchwheel":
-        return (ev.value + 64) / 128
-    return ev.value / 127
+    bounds = value_bounds(ev)
+    if ev.value is None or bounds is None:
+        raise ValueError("增减消息没有绝对数值，不能用于数值跟随")
+    lo, hi = bounds
+    # Preserve the old pitch normalization exactly, including its +64 endpoint.
+    span = 128 if ev.kind == "pitchwheel" and ev.value_mode != "full" else hi - lo
+    return max(0.0, min(1.0, (ev.value - lo) / span))
 
 
 def knob_step(a: dict, ev: MidiEvent, m: dict, follow: bool = False) -> int:
     """Signed step count for knob-driven actions: direction x acceleration."""
     d = 1
     if follow or a.get("follow_direction"):
-        d = direction(m.get("trigger", {}), ev)
+        trigger = m.get("trigger", {})
+        raw_steps = (ev.value is None or (trigger.get("relative_steps", False) and
+                     trigger.get("encoding") in ("rel_2c", "rel_64")) or trigger.get("encoding") in
+                     ("rel_signed", "rel_offset", "rel_arturia3"))
+        if raw_steps:
+            return relative_delta(trigger, ev)  # Encoded steps already carry speed.
+        d = direction(trigger, ev)
         if d == 0:
             return 0
     mult = 1
@@ -170,31 +198,116 @@ class ActionRunner:
         self.log = log
         self.variables = variables if variables is not None else {}
         self.volume = Volume()
-        self.held: dict[str, list[int]] = {}  # mapping id -> held vks
-        self.repeaters: dict[str, threading.Event] = {}
-        self.drags: dict[str, dict] = {}
+        self.held: dict[tuple, list[int]] = {}
+        self.repeaters: dict[tuple, threading.Event] = {}
+        self.drags: dict[tuple, dict] = {}
         self._lock = threading.RLock()
+        self._cancel = threading.Event()
+        self.epoch = 0
+        self._source_cancel: dict[str, threading.Event] = {}
+        self._key_owners: dict[int, set[tuple]] = {}
+        self._button_owners: dict[str, set[tuple]] = {}
+        self._explicit_keys: dict[tuple, set[int]] = {}
+        self._explicit_buttons: dict[tuple, set[str]] = {}
+        self.mouse_held: dict[tuple, set[str]] = {}
+        self._hold_sources: dict[tuple, tuple] = {}
+        self._hold_triggers: dict[tuple, dict] = {}
+        self._hold_mappings: dict[tuple, dict] = {}
+        self._hold_events: dict[tuple, MidiEvent] = {}
+        self.on_profile_event = None
+        self.on_state_change = None
+
+    @property
+    def down_keys(self) -> set[int]:
+        return set(self._key_owners)
+
+    @property
+    def down_buttons(self) -> set[str]:
+        return set(self._button_owners)
+
+    @staticmethod
+    def _owner(m: dict, ev: MidiEvent, role: str) -> tuple:
+        return (m["id"], ev.key, m.get("_action_index", 0), role)
+
+    def _acquire_keys(self, owner: tuple, vks) -> None:
+        fresh = [vk for vk in dict.fromkeys(vks) if vk not in self._key_owners]
+        if fresh:
+            win_input.key_down(fresh)
+        for vk in vks:
+            self._key_owners.setdefault(vk, set()).add(owner)
+
+    def _release_keys(self, owner: tuple, vks=None) -> None:
+        released = []
+        for vk in list(self._key_owners) if vks is None else dict.fromkeys(vks):
+            owners = self._key_owners.get(vk)
+            if owners is not None and owner in owners:
+                owners.remove(owner)
+                if not owners:
+                    del self._key_owners[vk]
+                    released.append(vk)
+        if released:
+            win_input.key_up(released)
+
+    def _acquire_button(self, owner: tuple, button: str) -> None:
+        if button not in self._button_owners:
+            win_input.mouse_button(button, "down")
+        self._button_owners.setdefault(button, set()).add(owner)
+
+    def _release_button(self, owner: tuple, button: str) -> None:
+        owners = self._button_owners.get(button)
+        if owners is not None and owner in owners:
+            owners.remove(owner)
+            if not owners:
+                del self._button_owners[button]
+                win_input.mouse_button(button, "up")
+
+    def _remember_hold(self, owner, ev, mapping):
+        self._hold_sources[owner] = ev.key
+        self._hold_triggers[owner] = dict(mapping.get("trigger", {}))
+        self._hold_mappings[owner] = mapping
+        self._hold_events[owner] = ev
+
+    def _release_hold(self, owner):
+        self.held.pop(owner, None)
+        self._release_keys(owner)
+        for button in self.mouse_held.pop(owner, set()):
+            self._release_button(owner, button)
+        stop = self.repeaters.pop(owner, None)
+        if stop:
+            stop.set()
+        self._hold_sources.pop(owner, None)
+        self._hold_triggers.pop(owner, None)
+        self._hold_mappings.pop(owner, None)
+        self._hold_events.pop(owner, None)
 
     def run(self, mapping: dict, ev: MidiEvent) -> None:
         lst = mapping.get("actions") or ([mapping["action"]] if "action" in mapping else [])
+        with self._lock:
+            cancel = self._cancel
+            source_cancel = self._source_cancel.setdefault(ev.source, threading.Event())
         if any(int(a.get("delay_ms", 0) or 0) > 0 for a in lst):
-            threading.Thread(target=self._run_list, args=(lst, ev, mapping), daemon=True).start()
+            threading.Thread(target=self._run_list, args=(lst, ev, mapping, cancel, source_cancel), daemon=True).start()
         else:
-            self._run_list(lst, ev, mapping)
+            self._run_list(lst, ev, mapping, cancel, source_cancel)
 
-    def _run_list(self, lst, ev, mapping):
-        for a in lst:
+    def _run_list(self, lst, ev, mapping, cancel, source_cancel):
+        for index, a in enumerate(lst):
             d = int(a.get("delay_ms", 0) or 0)
-            if d > 0:
-                time.sleep(d / 1000)
+            if source_cancel.wait(max(0, d) / 1000) or cancel.is_set():
+                return
             try:
                 with self._lock:
-                    self.run_one(a, ev, mapping)
+                    if cancel.is_set() or source_cancel.is_set():
+                        return
+                    self.run_one(a, ev, {**mapping, "_action_index": index})
             except Exception as e:
                 self.log(f"[{mapping.get('name')}] 动作失败: {e}")
 
     def run_one(self, a: dict, ev: MidiEvent, mapping: dict) -> None:
         t = a.get("type")
+        if ev.value is None and not (t in ("knob_keys", "mouse_drag") or
+                (t == "mouse_wheel" and a.get("follow_direction"))):
+            return  # Delta-only input can drive direction/step actions, not absolute actions.
         handler = getattr(self, f"_do_{t}", None)
         if handler is None:
             return
@@ -202,33 +315,91 @@ class ActionRunner:
 
     def release_all(self) -> None:
         with self._lock:
-            for vks in self.held.values():
-                win_input.key_up(vks)
-            self.held.clear()
+            self._cancel.set()
+            self._cancel = threading.Event()
+            self.epoch += 1
+            for token in self._source_cancel.values():
+                token.set()
+            self._source_cancel.clear()
             for stop in self.repeaters.values():
                 stop.set()
             self.repeaters.clear()
             for key in list(self.drags):
                 self._end_drag(key)
+            keys = sorted(self._key_owners)
+            if keys:
+                win_input.key_up(keys)
+            self.held.clear()
+            self._key_owners.clear()
+            for button in sorted(self._button_owners):
+                win_input.mouse_button(button, "up")
+            self._button_owners.clear()
+            self.mouse_held.clear()
+            self._hold_sources.clear()
+            self._hold_triggers.clear()
+            self._hold_mappings.clear()
+            self._hold_events.clear()
+            self._explicit_keys.clear()
+            self._explicit_buttons.clear()
+
+    def release_source(self, source: str) -> None:
+        """Cancel one input's macros and release only that input's owners."""
+        with self._lock:
+            token = self._source_cancel.pop(source, None)
+            if token:
+                token.set()
+            for owner in [o for o in self._hold_sources if o[1][0] == source]:
+                self._release_hold(owner)
+            for owner in [o for o in self.drags if o[1][0] == source]:
+                self._end_drag(owner)
+            for owner in [o for o in self._explicit_keys if o[1][0] == source]:
+                self._release_keys(owner)
+                self._explicit_keys.pop(owner, None)
+            for owner in [o for o in self._explicit_buttons if o[1][0] == source]:
+                for button in self._explicit_buttons.pop(owner):
+                    self._release_button(owner, button)
+
+    def release_for_event(self, ev: MidiEvent) -> None:
+        """Release the resources a physical control owns, even if conditions changed."""
+        with self._lock:
+            for key, source in list(self._hold_sources.items()):
+                if source != ev.key:
+                    continue
+                trigger = self._hold_triggers[key]
+                view = event_for_trigger(trigger, ev)
+                self._hold_events[key] = view
+                mapping = self._hold_mappings[key]
+                if (button_state(trigger, view) is False or
+                        not trigger_matches(trigger, view, gesture_ok=True) or
+                        not rules.check_conditions(mapping.get("conditions", ""), self.variables, view)):
+                    self._release_hold(key)
+
+    def reconcile_holds(self) -> None:
+        with self._lock:
+            for owner, mapping in list(self._hold_mappings.items()):
+                if not rules.check_conditions(mapping.get("conditions", ""), self.variables,
+                                              self._hold_events[owner]):
+                    self._release_hold(owner)
 
     @staticmethod
-    def _is_release(ev: MidiEvent) -> bool:
-        return ev.event == "release" or (ev.kind == "cc" and ev.value < 64)
+    def _is_release(ev: MidiEvent, mapping: dict | None = None) -> bool:
+        return button_state((mapping or {}).get("trigger", {}), ev) is False
 
     # --- handlers ---
     def _do_none(self, a, ev, m):
         pass
 
     def _do_set_var(self, a, ev, m):
+        previous = dict(self.variables)
         new = rules.apply_set_var(a, self.variables, ev)
         self.log(f"变量 {a.get('name')} = {new}")
+        if self.variables != previous and self.on_state_change:
+            self.on_state_change()
 
     def _do_repeat_key(self, a, ev, m):
-        key = m["id"]
-        if self._is_release(ev):
-            stop = self.repeaters.pop(key, None)
-            if stop:
-                stop.set()
+        key = self._owner(m, ev, "repeat")
+        if self._is_release(ev, m):
+            self._release_hold(key)
             return
         if key in self.repeaters:
             return
@@ -236,37 +407,71 @@ class ActionRunner:
         interval = max(10, int(a.get("interval_ms", 100))) / 1000
         stop = threading.Event()
         self.repeaters[key] = stop
+        self._remember_hold(key, ev, m)
 
         def loop():
             while not stop.is_set():
-                win_input.key_tap(vks)
+                with self._lock:
+                    if stop.is_set():
+                        return
+                    win_input.key_tap(vks)
                 stop.wait(interval)
         threading.Thread(target=loop, daemon=True).start()
 
     def _do_key(self, a, ev, m):
         vks = win_input.parse_combo(a.get("keys", ""))
         mode = a.get("mode", "tap")
+        owner = self._owner(m, ev, "hold" if mode == "hold" else "down")
         if mode == "hold":
-            if self._is_release(ev):
-                held = self.held.pop(m["id"], None)
-                if held:
-                    win_input.key_up(held)
-            elif m["id"] not in self.held:
-                self.held[m["id"]] = vks
-                win_input.key_down(vks)
+            if self._is_release(ev, m):
+                self._release_hold(owner)
+            elif owner not in self.held:
+                self.held[owner] = vks
+                self._remember_hold(owner, ev, m)
+                self._acquire_keys(owner, vks)
         elif mode == "down":
-            win_input.key_down(vks)
+            self._acquire_keys(owner, vks)
+            self._explicit_keys.setdefault(owner, set()).update(vks)
         elif mode == "up":
-            win_input.key_up(vks)
+            owned_before = self.down_keys
+            for key, keys in list(self._explicit_keys.items()):
+                if key[1][:1] == ev.key[:1] and key[1][2] == ev.channel:
+                    self._release_keys(key, vks)
+                    keys.difference_update(vks)
+                    if not keys:
+                        self._explicit_keys.pop(key, None)
+            unowned = [vk for vk in vks if vk not in owned_before]
+            if unowned:
+                win_input.key_up(unowned)
         else:
             win_input.key_tap(vks)
 
     def _do_mouse_button(self, a, ev, m):
         mode = a.get("mode", "click")
+        button = a.get("button", "left")
+        owner = self._owner(m, ev, "mouse_hold" if mode == "hold" else "mouse_down")
         if mode == "hold":
-            pressed = ev.event == "press" or (ev.kind == "cc" and ev.value >= 64)
-            mode = "down" if pressed else "up"
-        win_input.mouse_button(a.get("button", "left"), mode)
+            if self._is_release(ev, m):
+                self._release_hold(owner)
+            else:
+                self.mouse_held.setdefault(owner, set()).add(button)
+                self._remember_hold(owner, ev, m)
+                self._acquire_button(owner, button)
+        elif mode == "down":
+            self._acquire_button(owner, button)
+            self._explicit_buttons.setdefault(owner, set()).add(button)
+        elif mode == "up":
+            owned_before = button in self._button_owners
+            for key, buttons in list(self._explicit_buttons.items()):
+                if key[1][0] == ev.source and key[1][2] == ev.channel and button in buttons:
+                    self._release_button(key, button)
+                    buttons.discard(button)
+                    if not buttons:
+                        self._explicit_buttons.pop(key, None)
+            if not owned_before:
+                win_input.mouse_button(button, "up")
+        else:
+            win_input.mouse_button(button, mode)
 
     def _do_mouse_move(self, a, ev, m):
         dx, dy = float(a.get("dx", 0)), float(a.get("dy", 0))
@@ -281,46 +486,50 @@ class ActionRunner:
         if s == 0:
             return
         mods = win_input.parse_combo(a["modifiers"]) if a.get("modifiers") else []
+        owner = self._owner(m, ev, "wheel_modifiers")
         if mods:
-            win_input.key_down(mods)
+            self._acquire_keys(owner, mods)
         try:
             win_input.mouse_wheel(int(a.get("amount", 1)) * s, bool(a.get("horizontal")))
         finally:
             if mods:
-                win_input.key_up(mods)
+                self._release_keys(owner)
 
     def _do_mouse_drag(self, a, ev, m):
         s = knob_step(a, ev, m, follow=True)
         if s == 0:
             return
-        key = m["id"]
+        key = self._owner(m, ev, "drag")
         st = self.drags.get(key)
         if st is None:
             mods = win_input.parse_combo(a["modifiers"]) if a.get("modifiers") else []
             button = a.get("button", "left")
             if mods:
-                win_input.key_down(mods)
+                self._acquire_keys(key, mods)
             if button != "none":
-                win_input.mouse_button(button, "down")
-            st = self.drags[key] = {"mods": mods, "button": button, "timer": None}
+                self._acquire_button(key, button)
+            st = self.drags[key] = {"mods": mods, "button": button, "timer": None, "revision": 0}
         win_input.mouse_move(round(float(a.get("dx", 0)) * s), round(float(a.get("dy", 0)) * s))
         if st["timer"]:
             st["timer"].cancel()
-        st["timer"] = threading.Timer(max(50, int(a.get("idle_ms", 400))) / 1000, self._end_drag, (key,))
+        st["revision"] += 1
+        st["timer"] = threading.Timer(max(50, int(a.get("idle_ms", 400))) / 1000,
+                                      self._end_drag, (key, st, st["revision"]))
         st["timer"].daemon = True
         st["timer"].start()
 
-    def _end_drag(self, key):
+    def _end_drag(self, key, expected=None, revision=None):
         with self._lock:
-            st = self.drags.pop(key, None)
-            if not st:
+            st = self.drags.get(key)
+            if st is None or (expected is not None and (st is not expected or st["revision"] != revision)):
                 return
+            self.drags.pop(key)
             if st["timer"]:
                 st["timer"].cancel()
             if st["button"] != "none":
-                win_input.mouse_button(st["button"], "up")
+                self._release_button(key, st["button"])
             if st["mods"]:
-                win_input.key_up(st["mods"])
+                self._release_keys(key)
 
     def _do_knob_keys(self, a, ev, m):
         s = knob_step(a, ev, m, follow=True)
@@ -368,22 +577,20 @@ class ActionRunner:
         if self.midi_out is None or self.midi_out.port is None:
             self.log("MIDI 输出端口未打开")
             return
-        ch = max(1, min(16, int(a.get("channel", 1)))) - 1
-        num = int(a.get("number", 0))
         val = int(a.get("value", 127))
-        if a.get("pass_value") and ev.kind != "pitchwheel":
-            val = ev.value
-        kind = a.get("message", "note_on")
-        if kind == "note_on":
-            msg = mido.Message("note_on", channel=ch, note=num, velocity=val)
-        elif kind == "note_off":
-            msg = mido.Message("note_off", channel=ch, note=num, velocity=0)
-        elif kind == "control_change":
-            msg = mido.Message("control_change", channel=ch, control=num, value=val)
-        else:
-            msg = mido.Message("program_change", channel=ch, program=num)
-        self.midi_out.send(msg)
+        if a.get("pass_value"):
+            if ev.value is None:
+                return
+            if ev.kind in ("cc14", "rpn", "nrpn") or (ev.kind == "pitchwheel" and ev.value_mode == "full"):
+                val = round(_norm_value(ev) * 127)
+            elif ev.kind != "pitchwheel":
+                val = ev.value
+        val = max(0, min(127, val))
+        self.midi_out.send(make_midi_message(a, val))
 
     def _do_profile(self, a, ev, m):
-        if self.on_profile and a.get("name"):
-            self.on_profile(a["name"])
+        if a.get("name"):
+            if self.on_profile_event:
+                self.on_profile_event(a["name"], ev)
+            elif self.on_profile:
+                self.on_profile(a["name"])

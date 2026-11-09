@@ -1,0 +1,7 @@
+# Optional WinRT MIDI backend. PyWinRT 4.1 includes its own PyInstaller hook.
+winrt-runtime==4.1.0
+winrt-Windows.Devices.Midi==4!10.0.28000.2957
+winrt-Windows.Devices.Enumeration==4!10.0.28000.2957
+winrt-Windows.Storage.Streams==4!10.0.28000.2957
+winrt-Windows.Foundation==4!10.0.28000.2957
+winrt-Windows.Foundation.Collections==4!10.0.28000.2957

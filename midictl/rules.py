@@ -30,6 +30,8 @@ def check_conditions(text: str, variables: dict, ev=None) -> bool:
     for name, op, val in conds:
         if name == "$value":
             cur = ev.value if ev is not None else 0
+            if cur is None:
+                return False  # A parameter increment is not an absolute parameter value.
         elif name == "$number":
             cur = ev.number if ev is not None else 0
         else:
@@ -61,6 +63,8 @@ def apply_set_var(a: dict, variables: dict, ev=None) -> int:
     elif op == "toggle":
         new = 0 if cur else (v or 1)
     elif op == "from_value":
+        if ev is not None and ev.value is None:
+            return cur
         new = ev.value if ev is not None else 0
     else:
         new = v
